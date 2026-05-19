@@ -1,0 +1,145 @@
+stages:
+  - build
+  - obs-trigger
+  - obs-wait
+  - sync
+  - quality-gate
+  - update-repo
+  - iso-build
+
+variables:
+  # PACKAGE_NAME and PACKAGE_DIR should be set as CI/CD variables per project
+  # If not set, fallback to CI_PROJECT_NAME
+  PACKAGE_NAME: "${CI_PROJECT_NAME}"
+  PACKAGE_DIR: "${CI_PROJECT_NAME}"
+  OBS_API_URL: "http://localhost:4455"
+  OBS_USER: "Admin"
+  OBS_PASSWORD: "admin123"
+  OBS_REPOSITORY: "standard"
+  OBS_INTEGRATION_PROJECT: "home:Admin"
+  SYNC_URL: "http://localhost:8090"
+  QUALITY_GATE_URL: "http://localhost:8081"
+  OBS_POLL_INTERVAL: "30"
+  OBS_POLL_TIMEOUT: "600"
+  PACKER_INTEGRATION_SCRIPT: "/home/nando/AICICD/packer-integration/scripts/integrated-build.sh"
+
+# ─── 阶段1: 源码管理与触发 ───
+
+build:
+  stage: build
+  image: alpine:latest
+  script:
+    - echo "=== Intewell CI/CD - ${PACKAGE_NAME} ==="
+    - apk add --no-cache tar
+    # Create tarball with PackageName-Version/ subdirectory (required by %setup -q)
+    - mkdir -p /tmp/${PACKAGE_NAME}-1.0.0
+    - cp -r ${PACKAGE_DIR}/* /tmp/${PACKAGE_NAME}-1.0.0/
+    - cd /tmp && tar -czvf ${CI_PROJECT_DIR}/${PACKAGE_NAME}-1.0.0.tar.gz ${PACKAGE_NAME}-1.0.0/
+    - ls -la ${CI_PROJECT_DIR}/${PACKAGE_NAME}-1.0.0.tar.gz
+  artifacts:
+    paths:
+      - "*.tar.gz"
+    expire_in: 1 hour
+
+# ─── 阶段2: OBS 多架构 RPM 构建 ───
+
+obs-trigger:
+  stage: obs-trigger
+  image: alpine:latest
+  dependencies:
+    - build
+  script:
+    - echo "Triggering OBS build for home:Admin:${PACKAGE_NAME}"
+    - apk add --no-cache curl
+    # Upload source tarball
+    - |
+      curl -s -u "${OBS_USER}:${OBS_PASSWORD}" \
+        -T "${PACKAGE_NAME}-1.0.0.tar.gz" \
+        "${OBS_API_URL}/source/home:Admin:${PACKAGE_NAME}/${PACKAGE_NAME}/${PACKAGE_NAME}-1.0.0.tar.gz"
+    # Upload spec file
+    - |
+      curl -s -u "${OBS_USER}:${OBS_PASSWORD}" \
+        -T "${PACKAGE_DIR}/${PACKAGE_NAME}.spec" \
+        "${OBS_API_URL}/source/home:Admin:${PACKAGE_NAME}/${PACKAGE_NAME}/${PACKAGE_NAME}.spec"
+    - echo "OBS build triggered for home:Admin:${PACKAGE_NAME}"
+
+obs-wait:
+  stage: obs-wait
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      elapsed=0
+      while [ $elapsed -lt $OBS_POLL_TIMEOUT ]; do
+        status=$(curl -s "${SYNC_URL}/obs-build-status/home:Admin:${PACKAGE_NAME}/${PACKAGE_NAME}")
+        all_done=$(echo "$status" | jq -r '.all_done')
+        echo "[${elapsed}s] ${PACKAGE_NAME} all_done=${all_done}"
+        if [ "$all_done" = "true" ]; then
+          echo "$status" | jq -r '.results[] | .arch + ": " + .code'
+          echo "OBS build completed for ${PACKAGE_NAME}!"
+          exit 0
+        fi
+        sleep $OBS_POLL_INTERVAL
+        elapsed=$((elapsed + OBS_POLL_INTERVAL))
+      done
+      echo "ERROR: OBS build timed out for ${PACKAGE_NAME}"
+      exit 1
+
+# ─── 阶段3: 制品同步与质量门禁 ───
+
+sync-x86_64:
+  stage: sync
+  image: alpine:latest
+  script:
+    - echo "Syncing x86_64 from integration project"
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_URL}/sync-all/${OBS_INTEGRATION_PROJECT}/${OBS_REPOSITORY}/x86_64"
+
+sync-aarch64:
+  stage: sync
+  image: alpine:latest
+  script:
+    - echo "Syncing aarch64 from integration project"
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_URL}/sync-all/${OBS_INTEGRATION_PROJECT}/${OBS_REPOSITORY}/aarch64"
+
+quality-gate-x86_64:
+  stage: quality-gate
+  image: alpine:latest
+  script:
+    - echo "Quality gate x86_64 for ${PACKAGE_NAME}"
+    - apk add --no-cache curl jq
+    - |
+      curl -s -X POST "${QUALITY_GATE_URL}/check" \
+        -H "Content-Type: application/json" \
+        -d "{\"project\":\"home:Admin:${PACKAGE_NAME}\",\"package\":\"${PACKAGE_NAME}\",\"arch\":\"x86_64\"}"
+
+quality-gate-aarch64:
+  stage: quality-gate
+  image: alpine:latest
+  script:
+    - echo "Quality gate aarch64 for ${PACKAGE_NAME}"
+    - apk add --no-cache curl jq
+    - |
+      curl -s -X POST "${QUALITY_GATE_URL}/check" \
+        -H "Content-Type: application/json" \
+        -d "{\"project\":\"home:Admin:${PACKAGE_NAME}\",\"package\":\"${PACKAGE_NAME}\",\"arch\":\"aarch64\"}"
+
+# ─── 阶段4: 系统镜像集成构建 ───
+
+update-repo:
+  stage: update-repo
+  image: alpine:latest
+  script:
+    - echo "Updating repository metadata"
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_URL}/update-repo/x86_64"
+    - curl -s -X POST "${SYNC_URL}/update-repo/aarch64"
+
+iso-build:
+  stage: iso-build
+  script:
+    - echo "Building ISO image with Intewell-unified-packer..."
+    - ${PACKER_INTEGRATION_SCRIPT} aarch64 S5000C
+    - echo "ISO build complete"
+  when: on_success

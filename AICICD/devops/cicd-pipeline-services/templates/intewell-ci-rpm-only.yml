@@ -1,0 +1,102 @@
+stages:
+  - build
+  - obs-trigger
+  - obs-wait
+  - sync
+  - quality-gate
+  - update-repo
+
+variables:
+  PACKAGE_NAME: "${CI_PROJECT_NAME}"
+  PACKAGE_DIR: "${CI_PROJECT_NAME}"
+  OBS_USER: "Admin"
+  OBS_PASSWORD: "admin123"
+  OBS_API: "http://localhost:4455"
+  SYNC_SERVICE: "http://localhost:8090"
+  QUALITY_GATE: "http://localhost:8081"
+
+build:
+  stage: build
+  image: alpine:latest
+  script:
+    - echo "=== Intewell CI/CD - ${PACKAGE_NAME} ==="
+    - apk add --no-cache tar
+    - mkdir -p /tmp/${PACKAGE_NAME}-${PACKAGE_VERSION}
+    - cp -r ${PACKAGE_DIR}/* /tmp/${PACKAGE_NAME}-${PACKAGE_VERSION}/
+    - cd /tmp && tar -czvf ${CI_PROJECT_DIR}/${PACKAGE_NAME}-${PACKAGE_VERSION}.tar.gz ${PACKAGE_NAME}-${PACKAGE_VERSION}/
+    - ls -la ${CI_PROJECT_DIR}/${PACKAGE_NAME}-${PACKAGE_VERSION}.tar.gz
+  artifacts:
+    paths:
+      - "*.tar.gz"
+    expire_in: 1 hour
+
+obs-trigger:
+  stage: obs-trigger
+  image: alpine:latest
+  dependencies:
+    - build
+  script:
+    - apk add --no-cache curl
+    - OBS_PROJECT="home:Admin:${PACKAGE_NAME}"
+    - curl -s -u "${OBS_USER}:${OBS_PASSWORD}" -T "${PACKAGE_NAME}-${PACKAGE_VERSION}.tar.gz" "${OBS_API}/source/${OBS_PROJECT}/${PACKAGE_NAME}/${PACKAGE_NAME}-${PACKAGE_VERSION}.tar.gz"
+    - curl -s -u "${OBS_USER}:${OBS_PASSWORD}" -T "${PACKAGE_DIR}/${PACKAGE_NAME}.spec" "${OBS_API}/source/${OBS_PROJECT}/${PACKAGE_NAME}/${PACKAGE_NAME}.spec"
+    - echo "OBS build triggered for ${OBS_PROJECT}"
+
+obs-wait:
+  stage: obs-wait
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl jq
+    - |
+      OBS_PROJECT="home:Admin:${PACKAGE_NAME}"
+      elapsed=0
+      while [ $elapsed -lt 600 ]; do
+        status=$(curl -s "${SYNC_SERVICE}/obs-build-status/${OBS_PROJECT}/${PACKAGE_NAME}")
+        all_done=$(echo "$status" | jq -r '.all_done')
+        echo "[${elapsed}s] ${PACKAGE_NAME} all_done=${all_done}"
+        if [ "$all_done" = "true" ]; then
+          echo "OBS build completed!"
+          exit 0
+        fi
+        sleep 30
+        elapsed=$((elapsed + 30))
+      done
+      echo "ERROR: OBS build timed out"
+      exit 1
+
+sync-x86_64:
+  stage: sync
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_SERVICE}/sync-all/home:Admin/standard/x86_64"
+
+sync-aarch64:
+  stage: sync
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_SERVICE}/sync-all/home:Admin/standard/aarch64"
+
+quality-gate-x86_64:
+  stage: quality-gate
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - curl -s "${QUALITY_GATE}/check?project=home:Admin:${PACKAGE_NAME}&package=${PACKAGE_NAME}&arch=x86_64"
+
+quality-gate-aarch64:
+  stage: quality-gate
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - curl -s "${QUALITY_GATE}/check?project=home:Admin:${PACKAGE_NAME}&package=${PACKAGE_NAME}&arch=aarch64"
+
+update-repo:
+  stage: update-repo
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - curl -s -X POST "${SYNC_SERVICE}/sync-all/home:Admin/standard/x86_64"
+    - curl -s -X POST "${SYNC_SERVICE}/sync-all/home:Admin/standard/aarch64"
+    - echo "Repository updated (sync-all includes createrepo_c)"

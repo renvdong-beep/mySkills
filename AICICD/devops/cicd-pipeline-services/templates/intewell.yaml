@@ -1,0 +1,45 @@
+# intewell.yaml — Developer Build Configuration
+
+Place this file in the GitLab repository root to control CI/CD build behavior.
+
+## Full Example
+
+```yaml
+package:
+  name: test1          # Package name (must match OBS sub-project name)
+  version: 1.0.0       # Package version
+
+build:
+  target: iso          # iso | rpm-only
+  arch:                # Optional, default: [x86_64, aarch64]
+    - x86_64
+    - aarch64
+```
+
+## Build Targets
+
+| Target | Pipeline Stages | Description |
+|--------|----------------|-------------|
+| `iso` | 8 stages (build → obs-trigger → obs-wait → sync → quality-gate → update-repo → iso-build) | Full pipeline including ISO generation |
+| `rpm-only` | 6 stages (build → obs-trigger → obs-wait → sync → quality-gate → update-repo) | Stop at RPM repository update |
+
+## Minimal Example (rpm-only, default)
+
+```yaml
+package:
+  name: my-package
+  version: 1.0.0
+```
+
+When `build.target` is omitted, defaults to `rpm-only`.
+When `build.arch` is omitted, defaults to both `x86_64` and `aarch64`.
+
+## How It Works
+
+1. Developer pushes code to GitLab
+2. GitLab Webhook triggers webhook-server (port 8091)
+3. webhook-server reads `intewell.yaml` from the repository
+4. Based on `build.target`, selects the appropriate CI template:
+   - `iso` → `.gitlab-ci-template-iso.yml` (8 stages)
+   - `rpm-only` → `.gitlab-ci-template.yml` (6 stages)
+5. Auto-onboard: creates OBS sub-project, sets CI variables, uploads template, triggers Pipeline
